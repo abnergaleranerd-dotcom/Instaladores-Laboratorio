@@ -1,4 +1,6 @@
 #Requires -Version 5.1
+# Desbloqueia a execução do script na sessão atual sem alterar a política global
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 <#
 .SYNOPSIS
     Automatiza o setup completo do ambiente de desenvolvimento Windows.
@@ -513,5 +515,9 @@ Write-Host "    sejam ativadas corretamente."                             -Foreg
 Write-Host ""
 Write-Host ("=" * 70) -ForegroundColor DarkCyan
 Write-Host ""
+
+# Mantém a janela aberta para que o usuário leia o resultado final
+Write-Host "  Pressione ENTER para fechar esta janela..." -ForegroundColor DarkGray
+Read-Host | Out-Null
 
 #endregion
