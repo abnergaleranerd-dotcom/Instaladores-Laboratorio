@@ -1,663 +1,417 @@
 #Requires -Version 5.1
-# Desbloqueia a execução do script na sessão atual sem alterar a política global
+# Desbloqueia execução apenas para esta sessão — não altera política global
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+
 <#
 .SYNOPSIS
-    Automatiza o setup completo do ambiente de desenvolvimento Windows.
-
+    Setup automatizado do ambiente de desenvolvimento Windows (pt-BR).
 .DESCRIPTION
-    Script de provisionamento que instala e configura ferramentas de desenvolvimento
-    usando o Winget como gerenciador de pacotes principal. Inclui Visual Studio 2022,
-    VS Code com extensões, Git, .NET, Python, Node.js e demais utilitários.
-
+    Instala e configura ferramentas via Winget. Baseado nos padrões
+    testados em laboratório (--exact --force, sem --source, sem --locale).
 .NOTES
-    Versão    : 1.0.0
-    Idioma    : Português do Brasil (pt-BR)
-    Requisito : Windows 10/11 com Winget instalado, executado como Administrador.
+    Versão    : 9.0
+    Requisito : Windows 10/11, Winget instalado, executar como Administrador.
 #>
 
 # =============================================================================
-#region CONFIGURAÇÃO INICIAL E VERIFICAÇÕES
+# CONFIGURAÇÃO GLOBAL
 # =============================================================================
 
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
+# Continue: não para o script em erros não-críticos (padrão dos scripts de laboratório)
+$ErrorActionPreference = "Continue"
 
-# Pasta de downloads do usuário atual (destino para instaladores pesados)
-$PastaDownloads = "$env:USERPROFILE\Downloads"
+# Pasta para downloads de instaladores pesados
+$PastaInstaladores = "$env:USERPROFILE\Downloads"
 
-# Garante que a pasta de downloads existe
-if (-not (Test-Path $PastaDownloads)) {
-    New-Item -ItemType Directory -Path $PastaDownloads -Force | Out-Null
-}
+# Referências globais resolvidas uma única vez
+$script:WingetExe = $null
+$script:CodeExe   = $null
 
-# ---------------------------------------------------------------------------
-# Funções de log com cores padronizadas
-# ---------------------------------------------------------------------------
+# =============================================================================
+# FUNÇÕES DE LOG
+# =============================================================================
 
-function Escrever-Sucesso {
-    param([string]$Mensagem)
-    Write-Host "[OK] $Mensagem" -ForegroundColor Green
-}
+function Write-OK($msg)       { Write-Host "[OK] $msg" -ForegroundColor Green }
+function Write-Info($msg)     { Write-Host "[INFO] $msg" -ForegroundColor White }
+function Write-Aviso($msg)    { Write-Host "[AVISO] $msg" -ForegroundColor Yellow }
+function Write-Falha($msg)    { Write-Host "[ERRO] $msg" -ForegroundColor Red }
+function Write-Download($msg) { Write-Host "[DOWNLOAD] $msg" -ForegroundColor Cyan }
 
-function Escrever-Download {
-    param([string]$Mensagem)
-    Write-Host "[DOWNLOAD] $Mensagem" -ForegroundColor Cyan
-}
-
-function Escrever-Aviso {
-    param([string]$Mensagem)
-    Write-Warning $Mensagem
-}
-
-function Escrever-Erro {
-    param([string]$Mensagem)
-    Write-Host "[ERRO] $Mensagem" -ForegroundColor Red
-}
-
-function Escrever-Info {
-    param([string]$Mensagem)
-    Write-Host "[INFO] $Mensagem" -ForegroundColor White
-}
-
-function Escrever-Secao {
-    param([string]$Titulo)
+function Write-Secao($Titulo) {
     Write-Host ""
     Write-Host ("=" * 70) -ForegroundColor DarkCyan
     Write-Host "  $Titulo" -ForegroundColor Cyan
     Write-Host ("=" * 70) -ForegroundColor DarkCyan
 }
 
-# Caminhos completos resolvidos uma única vez e reutilizados em todo o script
-$script:WingetExe = $null
-$script:CodeExe   = $null
+# =============================================================================
+# FUNÇÕES UTILITÁRIAS
+# =============================================================================
 
 # ---------------------------------------------------------------------------
-# Localiza o winget.exe independentemente do PATH (essencial em sessões elevadas)
+# Verifica privilégios de Administrador
 # ---------------------------------------------------------------------------
+function Verificar-Admin {
+    $ehAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $ehAdmin) {
+        Write-Falha "Este script precisa ser executado como Administrador."
+        Write-Falha "Clique com o botão direito no arquivo .bat e escolha 'Executar como Administrador'."
+        Start-Sleep 5
+        exit 1
+    }
+    Write-OK "Privilégios de Administrador confirmados."
+}
 
+# ---------------------------------------------------------------------------
+# Localiza o winget.exe em múltiplos locais (essencial em sessões elevadas)
+# ---------------------------------------------------------------------------
 function Encontrar-Winget {
-    # 1. PATH da sessão atual (funciona se winget já estiver acessível)
+    # 1. PATH da sessão atual
     $cmd = Get-Command winget -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
 
-    # 2. Perfil do usuário logado — necessário porque sessões elevadas apontam
-    #    LOCALAPPDATA para o perfil do sistema, não do usuário real
-    $wingetEmPerfis = Get-Item "C:\Users\*\AppData\Local\Microsoft\WindowsApps\winget.exe" `
-                        -ErrorAction SilentlyContinue |
-                      Sort-Object LastWriteTime -Descending |
-                      Select-Object -First 1 -ExpandProperty FullName
-    if ($wingetEmPerfis) { return $wingetEmPerfis }
+    # 2. Perfis de usuário (sessão elevada não herda LOCALAPPDATA do usuário real)
+    $encontrado = Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            $p = Join-Path $_.FullName "AppData\Local\Microsoft\WindowsApps\winget.exe"
+            if (Test-Path $p) { $p }
+        } | Select-Object -First 1
+    if ($encontrado) { return $encontrado }
 
-    # 3. Pacote MSIX instalado globalmente em ProgramFiles\WindowsApps
-    $wingetMsix = Get-Item "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*\winget.exe" `
-                    -ErrorAction SilentlyContinue |
-                  Sort-Object LastWriteTime -Descending |
-                  Select-Object -First 1 -ExpandProperty FullName
-    if ($wingetMsix) { return $wingetMsix }
+    # 3. Pacote MSIX global
+    $msix = Get-Item "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*\winget.exe" `
+                -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+    if ($msix) { return $msix }
 
     return $null
 }
 
 # ---------------------------------------------------------------------------
-# Verificação de privilégios de Administrador
+# Instala um pacote via Winget
+# Padrão validado em laboratório: --exact --force sem --source sem --locale
+# --force: garante instalação mesmo quando há conflito de estado de versão
+# --exact: evita correspondências parciais de ID
 # ---------------------------------------------------------------------------
+function Instalar-Pacote($Nome, $Id) {
+    Write-Info "Instalando: $Nome ($Id)..."
 
-function Verificar-Administrador {
-    $identidade  = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal   = [Security.Principal.WindowsPrincipal] $identidade
-    $ehAdmin     = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    & $script:WingetExe install `
+        --exact --id $Id `
+        --accept-package-agreements `
+        --accept-source-agreements `
+        --silent --force
 
-    if (-not $ehAdmin) {
-        Escrever-Erro "Este script precisa ser executado como Administrador."
-        Escrever-Erro "Clique com o botão direito no PowerShell e selecione 'Executar como Administrador'."
-        exit 1
-    }
-
-    Escrever-Sucesso "Privilégios de Administrador confirmados."
-}
-
-# ---------------------------------------------------------------------------
-# Download robusto com fallback triplo (curl.exe → BITS → WebClient)
-# ---------------------------------------------------------------------------
-
-function Baixar-Arquivo {
-    param(
-        [string]$Url,
-        [string]$Destino,
-        [int]$TimeoutSegundos = 600
-    )
-
-    # --- Método 1: curl.exe nativo do Windows 10/11 (mais confiável, suporta redirect e timeout) ---
-    $curlExe = Get-Command curl.exe -ErrorAction SilentlyContinue
-    if ($curlExe) {
-        Escrever-Info "Usando curl.exe para download..."
-        & curl.exe --location --silent --show-error --progress-bar `
-                   --connect-timeout 30 `
-                   --max-time $TimeoutSegundos `
-                   --output $Destino `
-                   $Url
-
-        if ($LASTEXITCODE -eq 0 -and (Test-Path $Destino) -and (Get-Item $Destino).Length -gt 0) {
-            return  # sucesso
-        }
-        Escrever-Aviso "curl.exe falhou (código $LASTEXITCODE). Tentando método alternativo..."
-        Remove-Item $Destino -Force -ErrorAction SilentlyContinue
-    }
-
-    # --- Método 2: BITS (Background Intelligent Transfer Service) ---
-    try {
-        Escrever-Info "Usando BITS para download..."
-        Import-Module BitsTransfer -ErrorAction Stop
-        Start-BitsTransfer -Source $Url -Destination $Destino -TransferType Download -ErrorAction Stop
-
-        if ((Test-Path $Destino) -and (Get-Item $Destino).Length -gt 0) {
-            return  # sucesso
-        }
-    }
-    catch {
-        Escrever-Aviso "BITS falhou: $($_.Exception.Message). Tentando método alternativo..."
-        Remove-Item $Destino -Force -ErrorAction SilentlyContinue
-    }
-
-    # --- Método 3: WebClient com timeout explícito (último recurso) ---
-    Escrever-Info "Usando WebClient com timeout de $TimeoutSegundos segundos..."
-    try {
-        $cliente = New-Object System.Net.WebClient
-        # Registra evento de progresso para evitar travamento silencioso
-        $job = $cliente.DownloadFileTaskAsync($Url, $Destino)
-        $limite = [datetime]::UtcNow.AddSeconds($TimeoutSegundos)
-
-        while (-not $job.IsCompleted) {
-            if ([datetime]::UtcNow -gt $limite) {
-                $cliente.CancelAsync()
-                throw "Timeout de $TimeoutSegundos segundos excedido durante o download."
-            }
-            Start-Sleep -Milliseconds 500
-            Write-Host "." -NoNewline -ForegroundColor Cyan
-        }
-        Write-Host ""
-
-        if ($job.IsFaulted) {
-            throw $job.Exception.InnerException
-        }
-    }
-    finally {
-        $cliente.Dispose()
-    }
-
-    if (-not (Test-Path $Destino) -or (Get-Item $Destino).Length -eq 0) {
-        throw "Todos os métodos de download falharam para: $Url"
+    switch ($LASTEXITCODE) {
+        0            { Write-OK "$Nome instalado com sucesso." }
+        -1978335189  { Write-OK "$Nome já estava instalado (versão atual ou superior)." }
+        -1978335125  { Write-OK "$Nome já estava instalado." }
+        -1978335153  { Write-OK "$Nome já estava instalado." }
+        default      { Write-Aviso "$Nome — winget encerrou com código $LASTEXITCODE." }
     }
 }
 
 # ---------------------------------------------------------------------------
-# Verificação e instalação do Winget
+# Localiza o executável do VS Code (enumera perfis, não usa glob)
 # ---------------------------------------------------------------------------
-
-function Verificar-Winget {
-    $script:WingetExe = Encontrar-Winget
-
-    if (-not $script:WingetExe) {
-        Escrever-Erro "winget.exe não encontrado em nenhum local conhecido."
-        Escrever-Erro "Instale o 'App Installer' pela Microsoft Store e tente novamente."
-        exit 1
-    }
-
-    # Garante que o diretório do winget esteja no PATH desta sessão
-    $dirWinget = Split-Path $script:WingetExe -Parent
-    if ($env:Path -notlike "*$dirWinget*") {
-        $env:Path = "$dirWinget;$env:Path"
-    }
-
-    $versao = & $script:WingetExe --version 2>&1
-    Escrever-Sucesso "Winget encontrado em: $script:WingetExe ($versao)"
-}
-
-#endregion
-
-# =============================================================================
-#region FUNÇÕES DE INSTALAÇÃO
-# =============================================================================
-
-# ---------------------------------------------------------------------------
-# Instala um pacote via Winget com tratamento de erros individual
-# ---------------------------------------------------------------------------
-
-function Instalar-Pacote {
-    param(
-        [string]$NomeExibicao,
-        [string]$IdPacote,
-        [string]$Locale = ""
-    )
-
-    Escrever-Info "Instalando: $NomeExibicao ($IdPacote)..."
-
-    try {
-        # Códigos de saída conhecidos do winget que significam "ok" ou "já instalado"
-        $codigosSucesso = @(
-            0,              # Instalação concluída com êxito
-            -1978335189,    # UPDATE_NOT_APPLICABLE    — já na versão-alvo ou superior
-            -1978335153,    # outra variante de "já instalado"
-            -1978335125     # PACKAGE_ALREADY_INSTALLED (0x8A15006B) — "A package version is already installed"
-        )
-        # Código que indica ambiguidade de fonte (msstore SSL + winget) — único que justifica T3
-        $codigoAmbiguidade = -1978335138   # 0x8A15005E — SSL msstore + "please specify --source"
-
-        # Códigos que indicam "nenhum instalador compatível" — dispara fallback sem locale
-        $codigosSemLocale = @(
-            -1978335216,    # 0x8A150030 APPINSTALLER_CLI_ERROR_NO_APPLICABLE_INSTALLER
-            -1978335215     # 0x8A150031 variante em versões anteriores do winget
-        )
-
-        $argumentosBase = @(
-            "install",
-            "--id",     $IdPacote,
-            "--source", "winget",          # força fonte winget; evita erro SSL do msstore
-            "--silent",
-            "--accept-package-agreements",
-            "--accept-source-agreements",
-            "--no-upgrade"
-        )
-
-        # ── Tentativa 1: com locale pt-BR (se informado) ──────────────────
-        $argumentos = $argumentosBase
-        if ($Locale -ne "") {
-            $argumentos = $argumentosBase + @("--locale", $Locale)
-        }
-
-        # Usa o caminho completo resolvido em Verificar-Winget — sem depender do PATH
-        & $script:WingetExe @argumentos
-        $codigo = $LASTEXITCODE
-
-        if ($codigo -in $codigosSucesso) {
-            Escrever-Sucesso "$NomeExibicao instalado com sucesso."
-            return
-        }
-
-        # ── Tentativa 2: sem locale (fallback quando pt-BR não existe para o pacote) ──
-        if ($codigo -in $codigosSemLocale -and $Locale -ne "") {
-            Escrever-Aviso "Locale '$Locale' não disponível para '$NomeExibicao'. Repetindo sem localização..."
-            & $script:WingetExe @argumentosBase
-            $codigo = $LASTEXITCODE
-
-            if ($codigo -in $codigosSucesso) {
-                Escrever-Sucesso "$NomeExibicao instalado (sem localização pt-BR)."
-                return
-            }
-        }
-
-        # ── Tentativa 3: sem --source — só quando msstore causou ambiguidade de fonte ──
-        if ($codigo -eq $codigoAmbiguidade) {
-            Escrever-Aviso "Fonte msstore inacessível. Repetindo forçando apenas winget explicitamente..."
-            & $script:WingetExe "install" "--id" $IdPacote "--source" "winget" "--silent" `
-                "--accept-package-agreements" "--accept-source-agreements"
-            $codigo = $LASTEXITCODE
-
-            if ($codigo -in $codigosSucesso) {
-                Escrever-Sucesso "$NomeExibicao instalado com sucesso."
-                return
-            }
-        }
-
-        Escrever-Aviso "Winget encerrou com código $codigo ao instalar '$NomeExibicao'. Verifique manualmente."
-    }
-    catch {
-        Escrever-Erro "Falha ao instalar '$NomeExibicao'`: $($_.Exception.Message)"
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Localiza o executável do VS Code independentemente do PATH
-# ---------------------------------------------------------------------------
-
 function Encontrar-VSCode {
-    # 1. PATH da sessão atual
+    # 1. PATH da sessão
     $cmd = Get-Command code -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
 
-    # 2. Enumera todos os perfis em C:\Users (glob via Get-Item falha em sessões elevadas)
-    $perfis = Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue
-    foreach ($perfil in $perfis) {
-        $candidato = Join-Path $perfil.FullName "AppData\Local\Programs\Microsoft VS Code\bin\code.cmd"
-        if (Test-Path $candidato) { return $candidato }
-    }
+    # 2. Instalação por usuário — enumera C:\Users explicitamente
+    $encontrado = Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            $p = Join-Path $_.FullName "AppData\Local\Programs\Microsoft VS Code\bin\code.cmd"
+            if (Test-Path $p) { $p }
+        } | Select-Object -First 1
+    if ($encontrado) { return $encontrado }
 
-    # 3. Instalação de sistema (instalador System do VS Code)
+    # 3. Instalação de sistema
     foreach ($raiz in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
         if (-not $raiz) { continue }
-        $candidato = "$raiz\Microsoft VS Code\bin\code.cmd"
-        if (Test-Path $candidato) { return $candidato }
+        $p = "$raiz\Microsoft VS Code\bin\code.cmd"
+        if (Test-Path $p) { return $p }
     }
 
     return $null
 }
 
 # ---------------------------------------------------------------------------
-# Instala uma extensão do VS Code com tratamento de erros individual
+# Download robusto: curl.exe → BITS → Invoke-WebRequest
 # ---------------------------------------------------------------------------
+function Baixar-Arquivo($Url, $Destino, $Nome) {
+    if (Test-Path $Destino) {
+        Write-Info "$Nome já existe em $Destino — pulando download."
+        return
+    }
 
-function Instalar-ExtensaoVSCode {
-    param([string]$IdExtensao)
+    Write-Download "Baixando $Nome..."
+    Write-Download "Destino: $Destino"
 
-    Escrever-Info "Instalando extensão: $IdExtensao..."
-
-    try {
-        if (-not $script:CodeExe) {
-            Escrever-Aviso "VS Code não encontrado. Extensão '$IdExtensao' será pulada."
+    # Método 1: curl.exe nativo (timeout configurável, segue redirects)
+    $curlExe = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if ($curlExe) {
+        curl.exe --location --silent --show-error --progress-bar `
+                 --connect-timeout 30 --max-time 600 `
+                 --output $Destino $Url
+        if ($LASTEXITCODE -eq 0 -and (Test-Path $Destino) -and (Get-Item $Destino).Length -gt 0) {
+            Write-OK "$Nome baixado ($('{0:N0}' -f (Get-Item $Destino).Length) bytes)."
             return
         }
-
-        # Em sessão elevada o USERPROFILE aponta para o perfil Admin/sistema.
-        # Deriva o perfil real a partir do caminho do code.cmd encontrado,
-        # ou usa WMI para obter o usuário interativo logado.
-        $usuarioReal = $null
-        if ($script:CodeExe -match "C:\\Users\\([^\\]+)\\") {
-            $usuarioReal = $Matches[1]
-        }
-        else {
-            $usuarioReal = (Get-WmiObject Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName -replace '.*\\'
-        }
-
-        $argumentosExt = @("--install-extension", $IdExtensao, "--force")
-
-        # Usa apenas --extensions-dir (sem --user-data-dir): mantém o acesso ao marketplace
-        # configurado no VS Code do usuário real e instala no diretório correto
-        if ($usuarioReal -and (Test-Path "C:\Users\$usuarioReal")) {
-            $extensionsDir = "C:\Users\$usuarioReal\.vscode\extensions"
-            $argumentosExt += "--extensions-dir", $extensionsDir
-        }
-
-        # Sem 2>&1: evita que mensagens de erro do code.exe virem erros terminantes do PS
-        & $script:CodeExe @argumentosExt
-
-        if ($LASTEXITCODE -eq 0) {
-            Escrever-Sucesso "Extensão '$IdExtensao' instalada."
-        }
-        else {
-            Escrever-Aviso "Extensão '$IdExtensao' não instalada (código $LASTEXITCODE). Pode não existir no marketplace ou exigir instalação manual."
-        }
+        Remove-Item $Destino -Force -ErrorAction SilentlyContinue
+        Write-Aviso "curl.exe falhou. Tentando BITS..."
     }
-    catch {
-        Escrever-Aviso "Extensão '$IdExtensao' não pôde ser instalada: $($_.Exception.Message)"
+
+    # Método 2: BITS
+    try {
+        Start-BitsTransfer -Source $Url -Destination $Destino -TransferType Download -ErrorAction Stop
+        if ((Test-Path $Destino) -and (Get-Item $Destino).Length -gt 0) {
+            Write-OK "$Nome baixado via BITS."
+            return
+        }
+    } catch {
+        Remove-Item $Destino -Force -ErrorAction SilentlyContinue
+        Write-Aviso "BITS falhou. Tentando Invoke-WebRequest..."
+    }
+
+    # Método 3: Invoke-WebRequest com progresso desabilitado
+    try {
+        $ProgressPreference = 'SilentlyContinue'
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $Url -OutFile $Destino -UseBasicParsing
+        Write-OK "$Nome baixado."
+    } catch {
+        Write-Falha "Todos os métodos de download falharam para $Nome`: $($_.Exception.Message)"
     }
 }
 
-#endregion
-
 # =============================================================================
-#region BLOCO PRINCIPAL DE EXECUÇÃO
+# INÍCIO DA EXECUÇÃO
 # =============================================================================
 
 Clear-Host
 Write-Host ""
 Write-Host "  ╔══════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
 Write-Host "  ║     SETUP DO AMBIENTE DE DESENVOLVIMENTO - WINDOWS (pt-BR)      ║" -ForegroundColor Cyan
+Write-Host "  ║                        Versão 9.0                               ║" -ForegroundColor Cyan
 Write-Host "  ╚══════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 Write-Host ""
 
-# --- Pré-requisitos ---
-Verificar-Administrador
-Verificar-Winget
+# Pré-verificações
+Verificar-Admin
 
-Escrever-Info "Pasta de downloads temporários: $PastaDownloads"
-Write-Host ""
+$script:WingetExe = Encontrar-Winget
+if (-not $script:WingetExe) {
+    Write-Falha "winget.exe não encontrado. Instale o 'App Installer' pela Microsoft Store."
+    exit 1
+}
+$versaoWinget = & $script:WingetExe --version 2>&1
+Write-OK "Winget: $versaoWinget — $script:WingetExe"
+
+if (-not (Test-Path $PastaInstaladores)) {
+    New-Item -ItemType Directory -Path $PastaInstaladores -Force | Out-Null
+}
+Write-Info "Pasta de downloads: $PastaInstaladores"
 
 # =============================================================================
-#region 1. VISUAL STUDIO 2022 COMMUNITY (Instalação especial via bootstrapper)
+#region 1. VISUAL STUDIO 2022 COMMUNITY
 # =============================================================================
-Escrever-Secao "1/9 — Visual Studio 2022 Community"
+Write-Secao "1/9 — Visual Studio 2022 Community"
 
-try {
-    $urlBootstrapper = "https://aka.ms/vs/17/release/vs_community.exe"
-    $caminhoBootstrapper = Join-Path $PastaDownloads "vs_community.exe"
+$urlVS       = "https://aka.ms/vs/17/release/vs_community.exe"
+$caminhoVS   = Join-Path $PastaInstaladores "vs_community.exe"
 
-    # Baixa o bootstrapper oficial apenas se ainda não existir
-    if (-not (Test-Path $caminhoBootstrapper)) {
-        Escrever-Download "Baixando instalador do Visual Studio 2022 Community..."
-        Escrever-Download "URL   : $urlBootstrapper"
-        Escrever-Download "Destino: $caminhoBootstrapper"
-        Escrever-Info "(O bootstrapper tem ~1 MB; o conteúdo real (~3-5 GB) é baixado durante a instalação)"
+Baixar-Arquivo -Url $urlVS -Destino $caminhoVS -Nome "VS 2022 Bootstrapper"
 
-        Baixar-Arquivo -Url $urlBootstrapper -Destino $caminhoBootstrapper -TimeoutSegundos 120
+if (Test-Path $caminhoVS) {
+    Write-Info "Iniciando instalação passiva do VS2022 (pode levar vários minutos)..."
+    Write-Info "Cargas de trabalho: C# Desktop + C++ Desktop"
 
-        Escrever-Sucesso "Bootstrapper baixado com sucesso ($('{0:N0}' -f (Get-Item $caminhoBootstrapper).Length) bytes)."
-    }
-    else {
-        Escrever-Info "Bootstrapper já existe em: $caminhoBootstrapper — pulando download."
-    }
-
-    # Executa a instalação passiva com as cargas de trabalho C# e C++
-    Escrever-Info "Iniciando instalação passiva do Visual Studio 2022 (isso pode demorar vários minutos)..."
-
-    $argumentosVS = @(
-        "--add", "Microsoft.VisualStudio.Workload.ManagedDesktop",   # C# / .NET Desktop
-        "--add", "Microsoft.VisualStudio.Workload.NativeDesktop",    # C++ Desktop
+    $pVS = Start-Process -FilePath $caminhoVS -Wait -PassThru -ArgumentList `
+        "--add", "Microsoft.VisualStudio.Workload.ManagedDesktop",
+        "--add", "Microsoft.VisualStudio.Workload.NativeDesktop",
         "--includeRecommended",
         "--passive",
         "--norestart",
         "--lang", "pt-BR"
-    )
 
-    $processo = Start-Process -FilePath $caminhoBootstrapper `
-                              -ArgumentList $argumentosVS `
-                              -Wait `
-                              -PassThru
-
-    if ($processo.ExitCode -eq 0 -or $processo.ExitCode -eq 3010) {
-        # 3010 = instalação bem-sucedida, reinicialização pendente
-        Escrever-Sucesso "Visual Studio 2022 Community instalado com êxito."
-        if ($processo.ExitCode -eq 3010) {
-            Escrever-Aviso "Uma reinicialização do sistema é recomendada para concluir a instalação do VS2022."
+    switch ($pVS.ExitCode) {
+        0    { Write-OK "Visual Studio 2022 instalado com sucesso." }
+        3010 { Write-OK "Visual Studio 2022 instalado. Reinicialização recomendada." }
+        default {
+            Write-Aviso "VS2022 encerrou com código $($pVS.ExitCode)."
+            Write-Aviso "Verifique os logs em: %TEMP%\dd_setup_*.log"
         }
     }
-    else {
-        Escrever-Aviso "O instalador do VS2022 encerrou com código $($processo.ExitCode). Verifique os logs em %TEMP%\dd_setup_*.log"
-    }
+} else {
+    Write-Falha "Bootstrapper não encontrado. VS2022 não será instalado."
 }
-catch {
-    Escrever-Erro "Falha durante a instalação do Visual Studio 2022: $($_.Exception.Message)"
-}
-
 #endregion
 
 # =============================================================================
 #region 2. VISUAL STUDIO CODE
 # =============================================================================
-Escrever-Secao "2/9 — Visual Studio Code"
-
-Instalar-Pacote -NomeExibicao "Visual Studio Code" -IdPacote "Microsoft.VisualStudioCode" -Locale "pt-BR"
-
+Write-Secao "2/9 — Visual Studio Code"
+Instalar-Pacote "Visual Studio Code" "Microsoft.VisualStudioCode"
 #endregion
 
 # =============================================================================
 #region 3. EXTENSÕES DO VS CODE
 # =============================================================================
-Escrever-Secao "3/9 — Extensões do Visual Studio Code"
+Write-Secao "3/9 — Extensões do Visual Studio Code"
 
-# Localiza o code.exe/code.cmd — igual ao que fazemos com o winget
-# (necessário porque sessões elevadas não herdam o PATH do usuário real)
 $script:CodeExe = Encontrar-VSCode
 
 if ($script:CodeExe) {
-    # Adiciona o bin do VS Code ao PATH da sessão
-    $dirCode = Split-Path $script:CodeExe -Parent
-    if ($env:Path -notlike "*$dirCode*") { $env:Path = "$dirCode;$env:Path" }
-    Escrever-Sucesso "VS Code encontrado em: $script:CodeExe"
-}
-else {
-    Escrever-Aviso "VS Code não localizado nos caminhos conhecidos — extensões serão puladas."
-    Escrever-Aviso "Caminhos verificados:"
-    Escrever-Aviso "  C:\Users\*\AppData\Local\Programs\Microsoft VS Code\bin\code.cmd"
-    Escrever-Aviso "  $env:ProgramFiles\Microsoft VS Code\bin\code.cmd"
-}
+    Write-OK "VS Code encontrado: $script:CodeExe"
 
-$extensoesVSCode = @(
-    @{ Id = "ms-dotnettools.csharp";            Desc = "C# / C# Dev Kit (suporte a .NET)"         },
-    @{ Id = "ms-python.python";                 Desc = "Python (suporte completo à linguagem)"      },
-    @{ Id = "ms-python.vscode-pylance";         Desc = "Pylance (motor de análise Python)"          },
-    @{ Id = "ms-vscode-remote.remote-wsl";      Desc = "Remote WSL (integração com o WSL)"          },
-    @{ Id = "eamodio.gitlens";                  Desc = "GitLens (visualização avançada do Git)"     },
-    @{ Id = "esbenp.prettier-vscode";           Desc = "Prettier (formatador universal)"            },
-    @{ Id = "usernamehw.errorlens";             Desc = "Error Lens (erros inline no editor)"        },
-    @{ Id = "soloman1124.pbi-tools";            Desc = "PBI Tools (sintaxe M do Power BI)"          },
-    @{ Id = "github.github-vscode-theme";       Desc = "GitHub Theme (tema escuro oficial)"         },
-    @{ Id = "miguelsolorio.vesper";             Desc = "Vesper (tema minimalista escuro)"            }
-)
+    # Detecta o usuário real para instalar no perfil correto (não no perfil Admin)
+    $usuarioReal = $null
+    if ($script:CodeExe -match "C:\\Users\\([^\\]+)\\") {
+        $usuarioReal = $Matches[1]
+    }
+    if (-not $usuarioReal) {
+        $usuarioReal = (Get-WmiObject Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName -replace '.*\\'
+    }
 
-foreach ($extensao in $extensoesVSCode) {
-    Escrever-Info "→ $($extensao.Desc)"
-    Instalar-ExtensaoVSCode -IdExtensao $extensao.Id
+    # Apenas --extensions-dir: preserva acesso ao marketplace; grava no local correto
+    $argsExt = @("--force")
+    if ($usuarioReal -and (Test-Path "C:\Users\$usuarioReal")) {
+        $extDir = "C:\Users\$usuarioReal\.vscode\extensions"
+        $argsExt += "--extensions-dir", $extDir
+        Write-Info "Extensões serão instaladas em: $extDir"
+    }
+
+    $extensoes = @(
+        @{ Id = "ms-dotnettools.csharp";        Desc = "C# / C# Dev Kit"        },
+        @{ Id = "ms-python.python";             Desc = "Python"                  },
+        @{ Id = "ms-python.vscode-pylance";     Desc = "Pylance"                 },
+        @{ Id = "ms-vscode-remote.remote-wsl";  Desc = "Remote WSL"              },
+        @{ Id = "eamodio.gitlens";              Desc = "GitLens"                 },
+        @{ Id = "esbenp.prettier-vscode";       Desc = "Prettier"                },
+        @{ Id = "usernamehw.errorlens";         Desc = "Error Lens"              },
+        @{ Id = "soloman1124.pbi-tools";        Desc = "PBI Tools (Power BI M)"  },
+        @{ Id = "github.github-vscode-theme";   Desc = "GitHub Theme"            },
+        @{ Id = "miguelsolorio.vesper";         Desc = "Vesper Theme"            }
+    )
+
+    foreach ($ext in $extensoes) {
+        Write-Info "→ $($ext.Desc)"
+        & $script:CodeExe --install-extension $ext.Id @argsExt 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-OK "Instalada: $($ext.Id)"
+        } else {
+            Write-Aviso "Não instalada: $($ext.Id) (código $LASTEXITCODE — pode não existir no marketplace)."
+        }
+    }
+} else {
+    Write-Aviso "VS Code não encontrado. Extensões serão puladas."
+    Write-Aviso "Execute o script novamente após instalar o VS Code."
 }
-
 #endregion
 
 # =============================================================================
 #region 4. GIT
 # =============================================================================
-Escrever-Secao "4/9 — Git"
-
-Instalar-Pacote -NomeExibicao "Git" -IdPacote "Git.Git" -Locale "pt-BR"
-
+Write-Secao "4/9 — Git"
+Instalar-Pacote "Git" "Git.Git"
 #endregion
 
 # =============================================================================
-#region 5. .NET SDK 8 / PYTHON 3.12 / NODE.JS LTS
+#region 5. .NET SDK 8 · PYTHON 3.12 · NODE.JS LTS
 # =============================================================================
-Escrever-Secao "5/9 — .NET SDK 8 · Python 3.12 · Node.js LTS"
-
-Instalar-Pacote -NomeExibicao ".NET SDK 8"    -IdPacote "Microsoft.DotNet.SDK.8"   -Locale "pt-BR"
-Instalar-Pacote -NomeExibicao "Python 3.12"   -IdPacote "Python.Python.3.12"       -Locale "pt-BR"
-Instalar-Pacote -NomeExibicao "Node.js LTS"   -IdPacote "OpenJS.NodeJS.LTS"        -Locale "pt-BR"
-
+Write-Secao "5/9 — .NET SDK 8 · Python 3.12 · Node.js LTS"
+Instalar-Pacote ".NET SDK 8"   "Microsoft.DotNet.SDK.8"
+Instalar-Pacote "Python 3.12"  "Python.Python.3.12"
+Instalar-Pacote "Node.js LTS"  "OpenJS.NodeJS.LTS"
 #endregion
 
 # =============================================================================
-#region 6. IDEs E FERRAMENTAS DE DESENVOLVIMENTO
+#region 6. PYCHARM COMMUNITY
 # =============================================================================
-Escrever-Secao "6/9 — IDEs e Ferramentas de Desenvolvimento"
-
-Instalar-Pacote -NomeExibicao "PyCharm Community" -IdPacote "JetBrains.PyCharm.Community" -Locale "pt-BR"
-
+Write-Secao "6/9 — PyCharm Community"
+Instalar-Pacote "PyCharm Community" "JetBrains.PyCharm.Community"
 #endregion
 
 # =============================================================================
-#region 7. FERRAMENTAS DE DADOS E VIRTUALIZAÇÃO
+#region 7. POWER BI · VIRTUALBOX · ARC · PUTTY
 # =============================================================================
-Escrever-Secao "7/9 — Dados, Virtualização e Navegador"
-
-Instalar-Pacote -NomeExibicao "Power BI Desktop" -IdPacote "Microsoft.PowerBIDesktop"  -Locale "pt-BR"
-Instalar-Pacote -NomeExibicao "VirtualBox"        -IdPacote "Oracle.VirtualBox"         -Locale "pt-BR"
-Instalar-Pacote -NomeExibicao "Arc Browser"       -IdPacote "TheBrowserCompany.Arc"     -Locale "pt-BR"
-Instalar-Pacote -NomeExibicao "PuTTY"             -IdPacote "PuTTY.PuTTY"              -Locale "pt-BR"
-
+Write-Secao "7/9 — Power BI Desktop · VirtualBox · Arc Browser · PuTTY"
+Instalar-Pacote "Power BI Desktop" "Microsoft.PowerBI"
+Instalar-Pacote "VirtualBox"       "Oracle.VirtualBox"
+Instalar-Pacote "Arc Browser"      "TheBrowserCompany.Arc"
+Instalar-Pacote "PuTTY"           "PuTTY.PuTTY"
 #endregion
 
 # =============================================================================
-#region 8. WSL — UBUNTU
+#region 8. WSL COM UBUNTU
 # =============================================================================
-Escrever-Secao "8/9 — WSL (Windows Subsystem for Linux) com Ubuntu"
+Write-Secao "8/9 — WSL (Windows Subsystem for Linux) com Ubuntu"
 
-try {
-    Escrever-Info "Instalando o WSL com a distribuição Ubuntu..."
-    Escrever-Aviso "Esta etapa pode solicitar reinicialização. Se pedido, reinicie e execute o script novamente."
+Write-Info "Instalando WSL + Ubuntu..."
+Write-Aviso "Se solicitado, reinicie o computador e execute o script novamente."
 
-    $processoWSL = Start-Process -FilePath "wsl" `
-                                 -ArgumentList "--install", "-d", "Ubuntu" `
-                                 -Wait `
-                                 -PassThru `
-                                 -NoNewWindow
+$pWSL = Start-Process -FilePath "wsl" `
+            -ArgumentList "--install", "-d", "Ubuntu" `
+            -Wait -PassThru -NoNewWindow
 
-    # Códigos aceitos: 0=sucesso, 1=já habilitado, -1=distro já existe (ERROR_ALREADY_EXISTS)
-    if ($processoWSL.ExitCode -in @(0, 1, -1)) {
-        Escrever-Sucesso "WSL com Ubuntu instalado (ou já estava instalado)."
-    }
-    else {
-        Escrever-Aviso "WSL encerrou com código $($processoWSL.ExitCode). Se o Ubuntu não aparecer no menu Iniciar, habilite os recursos manualmente:"
-        Escrever-Aviso "  dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart"
-        Escrever-Aviso "  dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart"
+switch ($pWSL.ExitCode) {
+    0  { Write-OK "WSL com Ubuntu instalado com sucesso." }
+    1  { Write-OK "WSL já estava habilitado." }
+    -1 { Write-OK "Ubuntu já está instalado no WSL." }
+    default {
+        Write-Aviso "WSL encerrou com código $($pWSL.ExitCode)."
+        Write-Aviso "Se o Ubuntu não aparecer, habilite manualmente:"
+        Write-Aviso "  dism /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all"
+        Write-Aviso "  dism /online /enable-feature /featurename:VirtualMachinePlatform /all"
     }
 }
-catch {
-    Escrever-Erro "Falha ao instalar o WSL: $($_.Exception.Message)"
-}
-
 #endregion
 
 # =============================================================================
-#region 9. VERIFICAÇÃO DE SOFTWARES INDISPONÍVEIS NO WINGET
+#region 9. GOOGLE ANTIGRAVITY
 # =============================================================================
-Escrever-Secao "9/9 — Verificação de Disponibilidade: Google Antigravity"
+Write-Secao "9/9 — Google Antigravity"
 
-# Pesquisa o pacote no Winget para confirmar se existe
-try {
-    Escrever-Info "Verificando disponibilidade do 'Google Antigravity' no repositório do Winget..."
-    $buscaAntigravity = & $script:WingetExe search "Google Antigravity" --accept-source-agreements 2>&1
-
-    # Verifica se algum resultado relevante foi retornado
-    if ($buscaAntigravity -match "Nenhum pacote encontrado" -or
-        $buscaAntigravity -match "No package found"        -or
-        $buscaAntigravity -notmatch "Google Antigravity") {
-
-        throw "Pacote não encontrado no repositório oficial."
-    }
-    else {
-        Escrever-Sucesso "Google Antigravity encontrado no Winget. Iniciando instalação..."
-        Instalar-Pacote -NomeExibicao "Google Antigravity" -IdPacote "Google.Antigravity"
-    }
-}
-catch {
-    Write-Host ""
-    Write-Warning @"
-INSTALAÇÃO MANUAL NECESSÁRIA — Google Antigravity
-─────────────────────────────────────────────────
-O software 'Google Antigravity' NÃO está disponível no repositório oficial
-do Winget e, por isso, não pôde ser instalado automaticamente.
-
-Para instalar manualmente:
-  1. Acesse o site oficial ou o repositório do projeto.
-  2. Baixe o instalador compatível com sua versão do Windows.
-  3. Execute o instalador e siga as instruções na tela.
-
-Dica: Pesquise por 'Google Antigravity' no GitHub ou no site do fabricante
-      para encontrar o instalador mais recente.
-"@
-    Write-Host ""
-}
-
+Write-Host ""
+Write-Host "  [AVISO] INSTALAÇÃO MANUAL NECESSÁRIA — Google Antigravity" -ForegroundColor Yellow
+Write-Host "  ──────────────────────────────────────────────────────────" -ForegroundColor DarkGray
+Write-Host "  O software 'Google Antigravity' NAO esta disponivel no" -ForegroundColor Yellow
+Write-Host "  repositorio oficial do Winget." -ForegroundColor Yellow
+Write-Host ""
+Write-Host "  Para instalar manualmente:" -ForegroundColor White
+Write-Host "    1. Acesse o site oficial ou repositorio do projeto." -ForegroundColor White
+Write-Host "    2. Baixe o instalador para Windows." -ForegroundColor White
+Write-Host "    3. Execute e siga as instrucoes." -ForegroundColor White
+Write-Host ""
 #endregion
 
 # =============================================================================
-#region RESUMO FINAL
+# RESUMO FINAL
 # =============================================================================
-
+Write-Host ("=" * 70) -ForegroundColor Green
+Write-Host "  SETUP CONCLUIDO" -ForegroundColor Green
+Write-Host ("=" * 70) -ForegroundColor Green
 Write-Host ""
-Write-Host ("=" * 70) -ForegroundColor DarkCyan
-Write-Host "  SETUP CONCLUÍDO" -ForegroundColor Green
-Write-Host ("=" * 70) -ForegroundColor DarkCyan
+Write-Host "  Instalacoes realizadas:" -ForegroundColor White
+Write-Host "  [1] Visual Studio 2022 Community (C# + C++, pt-BR)" -ForegroundColor Green
+Write-Host "  [2] Visual Studio Code"                              -ForegroundColor Green
+Write-Host "  [3] Extensoes do VS Code (10 extensoes)"            -ForegroundColor Green
+Write-Host "  [4] Git"                                            -ForegroundColor Green
+Write-Host "  [5] .NET SDK 8 · Python 3.12 · Node.js LTS"        -ForegroundColor Green
+Write-Host "  [6] PyCharm Community"                              -ForegroundColor Green
+Write-Host "  [7] Power BI · VirtualBox · Arc · PuTTY"           -ForegroundColor Green
+Write-Host "  [8] WSL com Ubuntu"                                 -ForegroundColor Green
+Write-Host "  [9] Google Antigravity — instalacao manual"         -ForegroundColor Yellow
 Write-Host ""
-Write-Host "  Etapas realizadas:" -ForegroundColor White
-Write-Host "  [1] Visual Studio 2022 Community (C# + C++, pt-BR)"  -ForegroundColor Green
-Write-Host "  [2] Visual Studio Code"                               -ForegroundColor Green
-Write-Host "  [3] Extensões do VS Code (10 extensões)"             -ForegroundColor Green
-Write-Host "  [4] Git"                                              -ForegroundColor Green
-Write-Host "  [5] .NET SDK 8 · Python 3.12 · Node.js LTS"          -ForegroundColor Green
-Write-Host "  [6] PyCharm Community"                                -ForegroundColor Green
-Write-Host "  [7] Power BI Desktop · VirtualBox · Arc · PuTTY"     -ForegroundColor Green
-Write-Host "  [8] WSL com Ubuntu"                                   -ForegroundColor Green
-Write-Host "  [9] Google Antigravity — verificação concluída"       -ForegroundColor Yellow
+Write-Host "  PROXIMOS PASSOS:" -ForegroundColor Yellow
+Write-Host "  >> REINICIE o computador para aplicar variaveis de ambiente." -ForegroundColor White
+Write-Host "  >> Apos reiniciar, abra o VS Code para ativar as extensoes." -ForegroundColor White
+Write-Host "  >> Instale o Google Antigravity manualmente." -ForegroundColor White
 Write-Host ""
-Write-Host "  IMPORTANTE:" -ForegroundColor Yellow
-Write-Host "  · Pode ser necessário REINICIAR o computador para concluir" -ForegroundColor Yellow
-Write-Host "    a instalação do WSL e/ou do Visual Studio 2022."          -ForegroundColor Yellow
-Write-Host "  · Após reiniciar, abra o VS Code para que as extensões"     -ForegroundColor Yellow
-Write-Host "    sejam ativadas corretamente."                             -ForegroundColor Yellow
-Write-Host ""
-Write-Host ("=" * 70) -ForegroundColor DarkCyan
+Write-Host ("=" * 70) -ForegroundColor Green
 Write-Host ""
 
-# Mantém a janela aberta para que o usuário leia o resultado final
-Write-Host "  Pressione ENTER para fechar esta janela..." -ForegroundColor DarkGray
-Read-Host | Out-Null
-
-#endregion
+Read-Host "  Pressione ENTER para fechar" | Out-Null
