@@ -195,7 +195,16 @@ function Instalar-Pacote {
     Escrever-Info "Instalando: $NomeExibicao ($IdPacote)..."
 
     try {
-        $argumentos = @(
+        # Códigos de saída conhecidos do winget que significam "ok"
+        $codigosSucesso = @(
+            0,              # Instalação concluída com êxito
+            -1978335189,    # Já instalado na versão-alvo ou superior (APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE)
+            -1978335153     # Já instalado; nenhuma ação necessária
+        )
+        # Código que indica "nenhum instalador para este locale"
+        $codigoSemLocale = -1978335215  # APPINSTALLER_CLI_ERROR_NO_APPLICABLE_INSTALLER
+
+        $argumentosBase = @(
             "install",
             "--id", $IdPacote,
             "--silent",
@@ -204,24 +213,39 @@ function Instalar-Pacote {
             "--no-upgrade"
         )
 
-        # Adiciona a localidade pt-BR quando especificada
+        # ── Tentativa 1: com locale pt-BR (se informado) ──────────────────
+        $argumentos = $argumentosBase
         if ($Locale -ne "") {
-            $argumentos += "--locale"
-            $argumentos += $Locale
+            $argumentos = $argumentosBase + @("--locale", $Locale)
         }
 
-        $resultado = & winget @argumentos 2>&1
+        # IMPORTANTE: sem captura de variável nem 2>&1
+        # O winget precisa de handles de console válidos para lançar os instaladores filhos.
+        # Redirecionar a saída quebra esse mecanismo e faz as instalações serem ignoradas silenciosamente.
+        & winget @argumentos
+        $codigo = $LASTEXITCODE
 
-        # O Winget retorna código 0 para sucesso e -1978335189 para "já instalado"
-        if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq -1978335189) {
-            Escrever-Sucesso "$NomeExibicao instalado com sucesso (ou já estava instalado)."
+        if ($codigo -in $codigosSucesso) {
+            Escrever-Sucesso "$NomeExibicao instalado com sucesso."
+            return
         }
-        else {
-            Escrever-Aviso "Winget retornou código $LASTEXITCODE ao instalar $NomeExibicao. Verifique manualmente."
+
+        # ── Tentativa 2: sem locale (fallback quando pt-BR não existe para o pacote) ──
+        if ($codigo -eq $codigoSemLocale -and $Locale -ne "") {
+            Escrever-Aviso "Locale '$Locale' não disponível para '$NomeExibicao'. Repetindo sem localização..."
+            & winget @argumentosBase
+            $codigo = $LASTEXITCODE
+
+            if ($codigo -in $codigosSucesso) {
+                Escrever-Sucesso "$NomeExibicao instalado (sem localização pt-BR)."
+                return
+            }
         }
+
+        Escrever-Aviso "Winget encerrou com código $codigo ao instalar '$NomeExibicao'. Verifique manualmente."
     }
     catch {
-        Escrever-Erro "Falha ao instalar $NomeExibicao`: $($_.Exception.Message)"
+        Escrever-Erro "Falha ao instalar '$NomeExibicao'`: $($_.Exception.Message)"
     }
 }
 
