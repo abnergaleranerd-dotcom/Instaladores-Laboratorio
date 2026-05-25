@@ -283,6 +283,17 @@ function Instalar-Pacote {
             }
         }
 
+        # ── Tentativa 3: sem --source (para pacotes ausentes no winget mas presentes no msstore) ──
+        Escrever-Aviso "Pacote não encontrado na fonte 'winget'. Tentando sem filtro de fonte..."
+        $argumentosSemFonte = $argumentosBase | Where-Object { $_ -ne "winget" -and $_ -ne "--source" }
+        & $script:WingetExe @argumentosSemFonte
+        $codigo = $LASTEXITCODE
+
+        if ($codigo -in $codigosSucesso) {
+            Escrever-Sucesso "$NomeExibicao instalado (fonte alternativa)."
+            return
+        }
+
         Escrever-Aviso "Winget encerrou com código $codigo ao instalar '$NomeExibicao'. Verifique manualmente."
     }
     catch {
@@ -299,14 +310,16 @@ function Encontrar-VSCode {
     $cmd = Get-Command code -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
 
-    # 2. Instalação por usuário (caminho padrão do instalador User do VS Code)
-    $caminhoUser = Get-Item "C:\Users\*\AppData\Local\Programs\Microsoft VS Code\bin\code.cmd" `
-                    -ErrorAction SilentlyContinue |
-                   Select-Object -First 1 -ExpandProperty FullName
-    if ($caminhoUser) { return $caminhoUser }
+    # 2. Enumera todos os perfis em C:\Users (glob via Get-Item falha em sessões elevadas)
+    $perfis = Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue
+    foreach ($perfil in $perfis) {
+        $candidato = Join-Path $perfil.FullName "AppData\Local\Programs\Microsoft VS Code\bin\code.cmd"
+        if (Test-Path $candidato) { return $candidato }
+    }
 
     # 3. Instalação de sistema (instalador System do VS Code)
-    foreach ($raiz in @("$env:ProgramFiles", "${env:ProgramFiles(x86)}")) {
+    foreach ($raiz in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if (-not $raiz) { continue }
         $candidato = "$raiz\Microsoft VS Code\bin\code.cmd"
         if (Test-Path $candidato) { return $candidato }
     }
@@ -329,7 +342,26 @@ function Instalar-ExtensaoVSCode {
             return
         }
 
-        & $script:CodeExe --install-extension $IdExtensao --force 2>&1 | Out-Null
+        # Em sessão elevada o USERPROFILE aponta para o perfil Admin/sistema.
+        # Deriva o perfil real a partir do caminho do code.cmd encontrado,
+        # ou usa WMI para obter o usuário interativo logado.
+        $usuarioReal = $null
+        if ($script:CodeExe -match "C:\\Users\\([^\\]+)\\") {
+            $usuarioReal = $Matches[1]
+        }
+        else {
+            $usuarioReal = (Get-WmiObject Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName -replace '.*\\'
+        }
+
+        $argumentosExt = @("--install-extension", $IdExtensao, "--force")
+
+        if ($usuarioReal -and (Test-Path "C:\Users\$usuarioReal")) {
+            $extensionsDir = "C:\Users\$usuarioReal\.vscode\extensions"
+            $userDataDir   = "C:\Users\$usuarioReal\AppData\Roaming\Code"
+            $argumentosExt += "--extensions-dir", $extensionsDir, "--user-data-dir", $userDataDir
+        }
+
+        & $script:CodeExe @argumentosExt 2>&1 | Out-Null
 
         if ($LASTEXITCODE -eq 0) {
             Escrever-Sucesso "Extensão '$IdExtensao' instalada."
@@ -440,12 +472,16 @@ Escrever-Secao "3/9 — Extensões do Visual Studio Code"
 $script:CodeExe = Encontrar-VSCode
 
 if ($script:CodeExe) {
+    # Adiciona o bin do VS Code ao PATH da sessão
+    $dirCode = Split-Path $script:CodeExe -Parent
+    if ($env:Path -notlike "*$dirCode*") { $env:Path = "$dirCode;$env:Path" }
     Escrever-Sucesso "VS Code encontrado em: $script:CodeExe"
 }
 else {
-    Escrever-Aviso "VS Code não foi localizado. As extensões serão puladas."
-    Escrever-Aviso "Após reiniciar o terminal, instale as extensões manualmente com:"
-    Escrever-Aviso "  code --install-extension <id>"
+    Escrever-Aviso "VS Code não localizado nos caminhos conhecidos — extensões serão puladas."
+    Escrever-Aviso "Caminhos verificados:"
+    Escrever-Aviso "  C:\Users\*\AppData\Local\Programs\Microsoft VS Code\bin\code.cmd"
+    Escrever-Aviso "  $env:ProgramFiles\Microsoft VS Code\bin\code.cmd"
 }
 
 $extensoesVSCode = @(
