@@ -349,9 +349,10 @@ Instalar-Pacote -NomeExibicao "Visual Studio Code" -IdPacote "Microsoft.VisualSt
 # =============================================================================
 Escrever-Secao "3/9 — Extensões do Visual Studio Code"
 
-# Atualiza o PATH da sessão atual para que o 'code' seja encontrado imediatamente
-$env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
-            [System.Environment]::GetEnvironmentVariable("Path", "User")
+# Atualiza o PATH da sessão para que 'code' seja encontrado sem reiniciar o terminal
+$machinePath = [System.Environment]::GetEnvironmentVariable("Path", [System.EnvironmentVariableTarget]::Machine)
+$userPath    = [System.Environment]::GetEnvironmentVariable("Path", [System.EnvironmentVariableTarget]::User)
+$env:Path    = (@($machinePath, $userPath) | Where-Object { $_ -ne $null -and $_ -ne "" }) -join ";"
 
 $extensoesVSCode = @(
     @{ Id = "ms-dotnettools.csharp";            Desc = "C# / C# Dev Kit (suporte a .NET)"         },

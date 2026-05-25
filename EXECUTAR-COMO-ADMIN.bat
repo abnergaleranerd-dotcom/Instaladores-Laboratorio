@@ -1,49 +1,64 @@
 @echo off
+setlocal enableextensions
+
 :: ============================================================
 ::  LANÇADOR DO SETUP DE DESENVOLVIMENTO
 ::  Duplo clique neste arquivo para iniciar.
-::  O Windows pedirá permissão de Administrador (UAC).
+::  O Windows pedirá confirmação de Administrador (UAC).
 :: ============================================================
 
-:: Verifica se já está rodando como Administrador
+:: ── Verifica privilégios de Administrador ──────────────────
 net session >nul 2>&1
-if %errorLevel% == 0 goto :JaAdmin
+if %errorlevel% equ 0 goto :JaAdmin
 
-:: Não é admin — relança o próprio .bat com elevação via PowerShell
+:: ── Ainda não é admin: reabre com UAC via VBScript ─────────
+:: (Método VBScript é o mais confiável — evita escaping frágil no PowerShell)
 echo Solicitando permissao de Administrador...
-powershell -NoProfile -Command ^
-  "Start-Process cmd -ArgumentList '/c \"%~f0\"' -Verb RunAs"
+
+set "VBS_TEMP=%TEMP%\elevacao_setup.vbs"
+
+echo Set oShell = CreateObject("Shell.Application")                          > "%VBS_TEMP%"
+echo oShell.ShellExecute "%~s0", "", "%~dp0", "runas", 1                    >> "%VBS_TEMP%"
+
+cscript //nologo "%VBS_TEMP%"
+del "%VBS_TEMP%" 2>nul
 exit /b
 
+:: ── Já é Administrador ─────────────────────────────────────
 :JaAdmin
-:: ── Já é administrador ──────────────────────────────────────
 
-:: Caminho do script PowerShell (mesma pasta deste .bat)
 set "SCRIPT=%~dp0Setup-AmbienteDesenvolvimento.ps1"
 
 if not exist "%SCRIPT%" (
-    echo [ERRO] Arquivo nao encontrado: %SCRIPT%
+    echo.
+    echo [ERRO] Arquivo nao encontrado:
+    echo        %SCRIPT%
+    echo.
     echo Certifique-se de que o .bat e o .ps1 estao na mesma pasta.
     pause
     exit /b 1
 )
 
 echo.
-echo  Iniciando Setup do Ambiente de Desenvolvimento...
-echo  Politica de execucao sera desbloqueada apenas para esta sessao.
+echo  =====================================================
+echo   Setup do Ambiente de Desenvolvimento - pt-BR
+echo  =====================================================
+echo.
+echo  Iniciando... (politica de execucao liberada so nesta sessao)
 echo.
 
-:: Executa o .ps1 com:
-::   -ExecutionPolicy Bypass  → ignora a política de execução do sistema
-::   -NoProfile               → não carrega perfis de usuário (mais rápido)
-::   -File                    → caminho do script
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%"
+:: Executa o .ps1 com ExecutionPolicy Bypass apenas para esta sessão
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%"
 
-:: Se o PowerShell sair com erro antes do Read-Host do script, mantém a janela
-if %errorLevel% neq 0 (
+:: Captura código de saída do PowerShell
+set "EXITCODE=%errorlevel%"
+
+if %EXITCODE% neq 0 (
     echo.
-    echo [ERRO] O script encerrou com codigo de erro: %errorLevel%
+    echo [ERRO] O script PowerShell encerrou com codigo: %EXITCODE%
+    echo Verifique as mensagens acima para identificar o problema.
     pause
 )
 
-exit /b
+endlocal
+exit /b %EXITCODE%
