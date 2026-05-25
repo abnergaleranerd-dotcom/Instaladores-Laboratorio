@@ -234,16 +234,20 @@ function Instalar-Pacote {
     Escrever-Info "Instalando: $NomeExibicao ($IdPacote)..."
 
     try {
-        # Códigos de saída conhecidos do winget que significam "ok"
+        # Códigos de saída conhecidos do winget que significam "ok" ou "já instalado"
         $codigosSucesso = @(
             0,              # Instalação concluída com êxito
-            -1978335189,    # Já instalado na versão-alvo ou superior (APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE)
-            -1978335153     # Já instalado; nenhuma ação necessária
+            -1978335189,    # UPDATE_NOT_APPLICABLE    — já na versão-alvo ou superior
+            -1978335153,    # outra variante de "já instalado"
+            -1978335125     # PACKAGE_ALREADY_INSTALLED (0x8A15006B) — "A package version is already installed"
         )
+        # Código que indica ambiguidade de fonte (msstore SSL + winget) — único que justifica T3
+        $codigoAmbiguidade = -1978335138   # 0x8A15005E — SSL msstore + "please specify --source"
+
         # Códigos que indicam "nenhum instalador compatível" — dispara fallback sem locale
         $codigosSemLocale = @(
             -1978335216,    # 0x8A150030 APPINSTALLER_CLI_ERROR_NO_APPLICABLE_INSTALLER
-            -1978335215     # 0x8A150031 variante observada em versões anteriores do winget
+            -1978335215     # 0x8A150031 variante em versões anteriores do winget
         )
 
         $argumentosBase = @(
@@ -283,15 +287,17 @@ function Instalar-Pacote {
             }
         }
 
-        # ── Tentativa 3: sem --source (para pacotes ausentes no winget mas presentes no msstore) ──
-        Escrever-Aviso "Pacote não encontrado na fonte 'winget'. Tentando sem filtro de fonte..."
-        $argumentosSemFonte = $argumentosBase | Where-Object { $_ -ne "winget" -and $_ -ne "--source" }
-        & $script:WingetExe @argumentosSemFonte
-        $codigo = $LASTEXITCODE
+        # ── Tentativa 3: sem --source — só quando msstore causou ambiguidade de fonte ──
+        if ($codigo -eq $codigoAmbiguidade) {
+            Escrever-Aviso "Fonte msstore inacessível. Repetindo forçando apenas winget explicitamente..."
+            & $script:WingetExe "install" "--id" $IdPacote "--source" "winget" "--silent" `
+                "--accept-package-agreements" "--accept-source-agreements"
+            $codigo = $LASTEXITCODE
 
-        if ($codigo -in $codigosSucesso) {
-            Escrever-Sucesso "$NomeExibicao instalado (fonte alternativa)."
-            return
+            if ($codigo -in $codigosSucesso) {
+                Escrever-Sucesso "$NomeExibicao instalado com sucesso."
+                return
+            }
         }
 
         Escrever-Aviso "Winget encerrou com código $codigo ao instalar '$NomeExibicao'. Verifique manualmente."
@@ -355,23 +361,25 @@ function Instalar-ExtensaoVSCode {
 
         $argumentosExt = @("--install-extension", $IdExtensao, "--force")
 
+        # Usa apenas --extensions-dir (sem --user-data-dir): mantém o acesso ao marketplace
+        # configurado no VS Code do usuário real e instala no diretório correto
         if ($usuarioReal -and (Test-Path "C:\Users\$usuarioReal")) {
             $extensionsDir = "C:\Users\$usuarioReal\.vscode\extensions"
-            $userDataDir   = "C:\Users\$usuarioReal\AppData\Roaming\Code"
-            $argumentosExt += "--extensions-dir", $extensionsDir, "--user-data-dir", $userDataDir
+            $argumentosExt += "--extensions-dir", $extensionsDir
         }
 
-        & $script:CodeExe @argumentosExt 2>&1 | Out-Null
+        # Sem 2>&1: evita que mensagens de erro do code.exe virem erros terminantes do PS
+        & $script:CodeExe @argumentosExt
 
         if ($LASTEXITCODE -eq 0) {
             Escrever-Sucesso "Extensão '$IdExtensao' instalada."
         }
         else {
-            Escrever-Aviso "Não foi possível instalar '$IdExtensao' (código $LASTEXITCODE)."
+            Escrever-Aviso "Extensão '$IdExtensao' não instalada (código $LASTEXITCODE). Pode não existir no marketplace ou exigir instalação manual."
         }
     }
     catch {
-        Escrever-Erro "Falha ao instalar extensão '$IdExtensao'`: $($_.Exception.Message)"
+        Escrever-Aviso "Extensão '$IdExtensao' não pôde ser instalada: $($_.Exception.Message)"
     }
 }
 
@@ -560,11 +568,12 @@ try {
                                  -PassThru `
                                  -NoNewWindow
 
-    if ($processoWSL.ExitCode -eq 0 -or $processoWSL.ExitCode -eq 1) {
+    # Códigos aceitos: 0=sucesso, 1=já habilitado, -1=distro já existe (ERROR_ALREADY_EXISTS)
+    if ($processoWSL.ExitCode -in @(0, 1, -1)) {
         Escrever-Sucesso "WSL com Ubuntu instalado (ou já estava instalado)."
     }
     else {
-        Escrever-Aviso "WSL encerrou com código $($processoWSL.ExitCode). Pode ser necessário habilitar o recurso manualmente:"
+        Escrever-Aviso "WSL encerrou com código $($processoWSL.ExitCode). Se o Ubuntu não aparecer no menu Iniciar, habilite os recursos manualmente:"
         Escrever-Aviso "  dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart"
         Escrever-Aviso "  dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart"
     }
