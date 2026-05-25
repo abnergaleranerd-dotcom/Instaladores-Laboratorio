@@ -85,6 +85,80 @@ function Verificar-Administrador {
 }
 
 # ---------------------------------------------------------------------------
+# Download robusto com fallback triplo (curl.exe → BITS → WebClient)
+# ---------------------------------------------------------------------------
+
+function Baixar-Arquivo {
+    param(
+        [string]$Url,
+        [string]$Destino,
+        [int]$TimeoutSegundos = 600
+    )
+
+    # --- Método 1: curl.exe nativo do Windows 10/11 (mais confiável, suporta redirect e timeout) ---
+    $curlExe = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if ($curlExe) {
+        Escrever-Info "Usando curl.exe para download..."
+        & curl.exe --location --silent --show-error --progress-bar `
+                   --connect-timeout 30 `
+                   --max-time $TimeoutSegundos `
+                   --output $Destino `
+                   $Url
+
+        if ($LASTEXITCODE -eq 0 -and (Test-Path $Destino) -and (Get-Item $Destino).Length -gt 0) {
+            return  # sucesso
+        }
+        Escrever-Aviso "curl.exe falhou (código $LASTEXITCODE). Tentando método alternativo..."
+        Remove-Item $Destino -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- Método 2: BITS (Background Intelligent Transfer Service) ---
+    try {
+        Escrever-Info "Usando BITS para download..."
+        Import-Module BitsTransfer -ErrorAction Stop
+        Start-BitsTransfer -Source $Url -Destination $Destino -TransferType Download -ErrorAction Stop
+
+        if ((Test-Path $Destino) -and (Get-Item $Destino).Length -gt 0) {
+            return  # sucesso
+        }
+    }
+    catch {
+        Escrever-Aviso "BITS falhou: $($_.Exception.Message). Tentando método alternativo..."
+        Remove-Item $Destino -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- Método 3: WebClient com timeout explícito (último recurso) ---
+    Escrever-Info "Usando WebClient com timeout de $TimeoutSegundos segundos..."
+    try {
+        $cliente = New-Object System.Net.WebClient
+        # Registra evento de progresso para evitar travamento silencioso
+        $job = $cliente.DownloadFileTaskAsync($Url, $Destino)
+        $limite = [datetime]::UtcNow.AddSeconds($TimeoutSegundos)
+
+        while (-not $job.IsCompleted) {
+            if ([datetime]::UtcNow -gt $limite) {
+                $cliente.CancelAsync()
+                throw "Timeout de $TimeoutSegundos segundos excedido durante o download."
+            }
+            Start-Sleep -Milliseconds 500
+            Write-Host "." -NoNewline -ForegroundColor Cyan
+        }
+        Write-Host ""
+
+        if ($job.IsFaulted) {
+            throw $job.Exception.InnerException
+        }
+    }
+    finally {
+        $cliente.Dispose()
+    }
+
+    if (-not (Test-Path $Destino) -or (Get-Item $Destino).Length -eq 0) {
+        throw "Todos os métodos de download falharam para: $Url"
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Verificação e instalação do Winget
 # ---------------------------------------------------------------------------
 
@@ -213,16 +287,13 @@ try {
     # Baixa o bootstrapper oficial apenas se ainda não existir
     if (-not (Test-Path $caminhoBootstrapper)) {
         Escrever-Download "Baixando instalador do Visual Studio 2022 Community..."
-        Escrever-Download "URL: $urlBootstrapper"
+        Escrever-Download "URL   : $urlBootstrapper"
         Escrever-Download "Destino: $caminhoBootstrapper"
+        Escrever-Info "(O bootstrapper tem ~1 MB; o conteúdo real (~3-5 GB) é baixado durante a instalação)"
 
-        $progressoAnterior = $ProgressPreference
-        $ProgressPreference = 'SilentlyContinue'   # Remove a barra de progresso lenta do PS
+        Baixar-Arquivo -Url $urlBootstrapper -Destino $caminhoBootstrapper -TimeoutSegundos 120
 
-        Invoke-WebRequest -Uri $urlBootstrapper -OutFile $caminhoBootstrapper -UseBasicParsing
-
-        $ProgressPreference = $progressoAnterior
-        Escrever-Sucesso "Bootstrapper baixado com sucesso."
+        Escrever-Sucesso "Bootstrapper baixado com sucesso ($('{0:N0}' -f (Get-Item $caminhoBootstrapper).Length) bytes)."
     }
     else {
         Escrever-Info "Bootstrapper já existe em: $caminhoBootstrapper — pulando download."
