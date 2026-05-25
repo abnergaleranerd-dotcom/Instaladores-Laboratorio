@@ -68,8 +68,9 @@ function Escrever-Secao {
     Write-Host ("=" * 70) -ForegroundColor DarkCyan
 }
 
-# Caminho completo do winget.exe — resolvido uma vez e reutilizado em todo o script
+# Caminhos completos resolvidos uma única vez e reutilizados em todo o script
 $script:WingetExe = $null
+$script:CodeExe   = $null
 
 # ---------------------------------------------------------------------------
 # Localiza o winget.exe independentemente do PATH (essencial em sessões elevadas)
@@ -244,7 +245,8 @@ function Instalar-Pacote {
 
         $argumentosBase = @(
             "install",
-            "--id", $IdPacote,
+            "--id",     $IdPacote,
+            "--source", "winget",          # força fonte winget; evita erro SSL do msstore
             "--silent",
             "--accept-package-agreements",
             "--accept-source-agreements",
@@ -286,6 +288,30 @@ function Instalar-Pacote {
 }
 
 # ---------------------------------------------------------------------------
+# Localiza o executável do VS Code independentemente do PATH
+# ---------------------------------------------------------------------------
+
+function Encontrar-VSCode {
+    # 1. PATH da sessão atual
+    $cmd = Get-Command code -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+
+    # 2. Instalação por usuário (caminho padrão do instalador User do VS Code)
+    $caminhoUser = Get-Item "C:\Users\*\AppData\Local\Programs\Microsoft VS Code\bin\code.cmd" `
+                    -ErrorAction SilentlyContinue |
+                   Select-Object -First 1 -ExpandProperty FullName
+    if ($caminhoUser) { return $caminhoUser }
+
+    # 3. Instalação de sistema (instalador System do VS Code)
+    foreach ($raiz in @("$env:ProgramFiles", "${env:ProgramFiles(x86)}")) {
+        $candidato = "$raiz\Microsoft VS Code\bin\code.cmd"
+        if (Test-Path $candidato) { return $candidato }
+    }
+
+    return $null
+}
+
+# ---------------------------------------------------------------------------
 # Instala uma extensão do VS Code com tratamento de erros individual
 # ---------------------------------------------------------------------------
 
@@ -295,21 +321,18 @@ function Instalar-ExtensaoVSCode {
     Escrever-Info "Instalando extensão: $IdExtensao..."
 
     try {
-        # Localiza o executável 'code' no PATH
-        $caminhoCode = Get-Command code -ErrorAction SilentlyContinue
-
-        if (-not $caminhoCode) {
-            Escrever-Aviso "O executável 'code' não foi encontrado no PATH. Reinicie o terminal após instalar o VS Code e execute novamente."
+        if (-not $script:CodeExe) {
+            Escrever-Aviso "VS Code não encontrado. Extensão '$IdExtensao' será pulada."
             return
         }
 
-        $saida = & code --install-extension $IdExtensao --force 2>&1
+        & $script:CodeExe --install-extension $IdExtensao --force 2>&1 | Out-Null
 
         if ($LASTEXITCODE -eq 0) {
             Escrever-Sucesso "Extensão '$IdExtensao' instalada."
         }
         else {
-            Escrever-Aviso "Não foi possível instalar a extensão '$IdExtensao'. Saída: $saida"
+            Escrever-Aviso "Não foi possível instalar '$IdExtensao' (código $LASTEXITCODE)."
         }
     }
     catch {
@@ -409,10 +432,18 @@ Instalar-Pacote -NomeExibicao "Visual Studio Code" -IdPacote "Microsoft.VisualSt
 # =============================================================================
 Escrever-Secao "3/9 — Extensões do Visual Studio Code"
 
-# Atualiza o PATH da sessão para que 'code' seja encontrado sem reiniciar o terminal
-$machinePath = [System.Environment]::GetEnvironmentVariable("Path", [System.EnvironmentVariableTarget]::Machine)
-$userPath    = [System.Environment]::GetEnvironmentVariable("Path", [System.EnvironmentVariableTarget]::User)
-$env:Path    = (@($machinePath, $userPath) | Where-Object { $_ -ne $null -and $_ -ne "" }) -join ";"
+# Localiza o code.exe/code.cmd — igual ao que fazemos com o winget
+# (necessário porque sessões elevadas não herdam o PATH do usuário real)
+$script:CodeExe = Encontrar-VSCode
+
+if ($script:CodeExe) {
+    Escrever-Sucesso "VS Code encontrado em: $script:CodeExe"
+}
+else {
+    Escrever-Aviso "VS Code não foi localizado. As extensões serão puladas."
+    Escrever-Aviso "Após reiniciar o terminal, instale as extensões manualmente com:"
+    Escrever-Aviso "  code --install-extension <id>"
+}
 
 $extensoesVSCode = @(
     @{ Id = "ms-dotnettools.csharp";            Desc = "C# / C# Dev Kit (suporte a .NET)"         },
