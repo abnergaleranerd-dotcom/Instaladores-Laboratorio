@@ -23,9 +23,8 @@ $ErrorActionPreference = "Continue"
 # Pasta para downloads de instaladores pesados
 $PastaInstaladores = "$env:USERPROFILE\Downloads"
 
-# Referências globais resolvidas uma única vez
-$script:WingetExe = $null
-$script:CodeExe   = $null
+# Referência ao VS Code resolvida após instalação
+$script:CodeExe = $null
 
 # =============================================================================
 # FUNÇÕES DE LOG
@@ -63,29 +62,41 @@ function Verificar-Admin {
 }
 
 # ---------------------------------------------------------------------------
-# Localiza o winget.exe em múltiplos locais (essencial em sessões elevadas)
+# Garante que o winget está no PATH — App Execution Aliases só funcionam
+# via PATH, não por invocação direta com caminho completo
 # ---------------------------------------------------------------------------
-function Encontrar-Winget {
-    # 1. PATH da sessão atual
-    $cmd = Get-Command winget -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd.Source }
+function Verificar-Winget {
+    # 1. Já está no PATH?
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        $v = winget --version 2>&1
+        Write-OK "Winget disponível: $v"
+        return
+    }
 
-    # 2. Perfis de usuário (sessão elevada não herda LOCALAPPDATA do usuário real)
-    $encontrado = Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue |
+    # 2. Procura nos perfis de usuário e adiciona ao PATH
+    $exe = Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue |
         ForEach-Object {
             $p = Join-Path $_.FullName "AppData\Local\Microsoft\WindowsApps\winget.exe"
             if (Test-Path $p) { $p }
         } | Select-Object -First 1
-    if ($encontrado) { return $encontrado }
 
-    # 3. Pacote MSIX global
-    $msix = Get-Item "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*\winget.exe" `
-                -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1 -ExpandProperty FullName
-    if ($msix) { return $msix }
+    if (-not $exe) {
+        # 3. Pacote MSIX global
+        $exe = Get-Item "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*\winget.exe" `
+                   -ErrorAction SilentlyContinue |
+               Sort-Object LastWriteTime -Descending |
+               Select-Object -First 1 -ExpandProperty FullName
+    }
 
-    return $null
+    if ($exe) {
+        $dir = Split-Path $exe -Parent
+        $env:Path = "$dir;$env:Path"
+        $v = winget --version 2>&1
+        Write-OK "Winget adicionado ao PATH: $v"
+    } else {
+        Write-Falha "winget não encontrado. Instale o 'App Installer' pela Microsoft Store."
+        exit 1
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -97,11 +108,8 @@ function Encontrar-Winget {
 function Instalar-Pacote($Nome, $Id) {
     Write-Info "Instalando: $Nome ($Id)..."
 
-    & $script:WingetExe install `
-        --exact --id $Id `
-        --accept-package-agreements `
-        --accept-source-agreements `
-        --silent --force
+    # winget direto via PATH — App Execution Alias não aceita invocação por caminho completo
+    winget install --exact --id $Id --accept-package-agreements --accept-source-agreements --silent --force
 
     switch ($LASTEXITCODE) {
         0            { Write-OK "$Nome instalado com sucesso." }
@@ -201,14 +209,7 @@ Write-Host ""
 
 # Pré-verificações
 Verificar-Admin
-
-$script:WingetExe = Encontrar-Winget
-if (-not $script:WingetExe) {
-    Write-Falha "winget.exe não encontrado. Instale o 'App Installer' pela Microsoft Store."
-    exit 1
-}
-$versaoWinget = & $script:WingetExe --version 2>&1
-Write-OK "Winget: $versaoWinget — $script:WingetExe"
+Verificar-Winget   # garante que 'winget' está no PATH desta sessão
 
 if (-not (Test-Path $PastaInstaladores)) {
     New-Item -ItemType Directory -Path $PastaInstaladores -Force | Out-Null
