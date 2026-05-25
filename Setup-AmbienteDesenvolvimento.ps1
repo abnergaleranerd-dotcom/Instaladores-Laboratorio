@@ -240,8 +240,11 @@ function Instalar-Pacote {
             -1978335189,    # Já instalado na versão-alvo ou superior (APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE)
             -1978335153     # Já instalado; nenhuma ação necessária
         )
-        # Código que indica "nenhum instalador para este locale"
-        $codigoSemLocale = -1978335215  # APPINSTALLER_CLI_ERROR_NO_APPLICABLE_INSTALLER
+        # Códigos que indicam "nenhum instalador compatível" — dispara fallback sem locale
+        $codigosSemLocale = @(
+            -1978335216,    # 0x8A150030 APPINSTALLER_CLI_ERROR_NO_APPLICABLE_INSTALLER
+            -1978335215     # 0x8A150031 variante observada em versões anteriores do winget
+        )
 
         $argumentosBase = @(
             "install",
@@ -269,7 +272,7 @@ function Instalar-Pacote {
         }
 
         # ── Tentativa 2: sem locale (fallback quando pt-BR não existe para o pacote) ──
-        if ($codigo -eq $codigoSemLocale -and $Locale -ne "") {
+        if ($codigo -in $codigosSemLocale -and $Locale -ne "") {
             Escrever-Aviso "Locale '$Locale' não disponível para '$NomeExibicao'. Repetindo sem localização..."
             & $script:WingetExe @argumentosBase
             $codigo = $LASTEXITCODE
