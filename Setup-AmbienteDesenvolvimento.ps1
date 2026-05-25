@@ -68,6 +68,36 @@ function Escrever-Secao {
     Write-Host ("=" * 70) -ForegroundColor DarkCyan
 }
 
+# Caminho completo do winget.exe — resolvido uma vez e reutilizado em todo o script
+$script:WingetExe = $null
+
+# ---------------------------------------------------------------------------
+# Localiza o winget.exe independentemente do PATH (essencial em sessões elevadas)
+# ---------------------------------------------------------------------------
+
+function Encontrar-Winget {
+    # 1. PATH da sessão atual (funciona se winget já estiver acessível)
+    $cmd = Get-Command winget -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+
+    # 2. Perfil do usuário logado — necessário porque sessões elevadas apontam
+    #    LOCALAPPDATA para o perfil do sistema, não do usuário real
+    $wingetEmPerfis = Get-Item "C:\Users\*\AppData\Local\Microsoft\WindowsApps\winget.exe" `
+                        -ErrorAction SilentlyContinue |
+                      Sort-Object LastWriteTime -Descending |
+                      Select-Object -First 1 -ExpandProperty FullName
+    if ($wingetEmPerfis) { return $wingetEmPerfis }
+
+    # 3. Pacote MSIX instalado globalmente em ProgramFiles\WindowsApps
+    $wingetMsix = Get-Item "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*\winget.exe" `
+                    -ErrorAction SilentlyContinue |
+                  Sort-Object LastWriteTime -Descending |
+                  Select-Object -First 1 -ExpandProperty FullName
+    if ($wingetMsix) { return $wingetMsix }
+
+    return $null
+}
+
 # ---------------------------------------------------------------------------
 # Verificação de privilégios de Administrador
 # ---------------------------------------------------------------------------
@@ -165,14 +195,22 @@ function Baixar-Arquivo {
 # ---------------------------------------------------------------------------
 
 function Verificar-Winget {
-    try {
-        $versaoWinget = winget --version 2>$null
-        Escrever-Sucesso "Winget encontrado: $versaoWinget"
-    }
-    catch {
-        Escrever-Erro "Winget não encontrado. Instale o 'App Installer' pela Microsoft Store e execute o script novamente."
+    $script:WingetExe = Encontrar-Winget
+
+    if (-not $script:WingetExe) {
+        Escrever-Erro "winget.exe não encontrado em nenhum local conhecido."
+        Escrever-Erro "Instale o 'App Installer' pela Microsoft Store e tente novamente."
         exit 1
     }
+
+    # Garante que o diretório do winget esteja no PATH desta sessão
+    $dirWinget = Split-Path $script:WingetExe -Parent
+    if ($env:Path -notlike "*$dirWinget*") {
+        $env:Path = "$dirWinget;$env:Path"
+    }
+
+    $versao = & $script:WingetExe --version 2>&1
+    Escrever-Sucesso "Winget encontrado em: $script:WingetExe ($versao)"
 }
 
 #endregion
@@ -219,10 +257,8 @@ function Instalar-Pacote {
             $argumentos = $argumentosBase + @("--locale", $Locale)
         }
 
-        # IMPORTANTE: sem captura de variável nem 2>&1
-        # O winget precisa de handles de console válidos para lançar os instaladores filhos.
-        # Redirecionar a saída quebra esse mecanismo e faz as instalações serem ignoradas silenciosamente.
-        & winget @argumentos
+        # Usa o caminho completo resolvido em Verificar-Winget — sem depender do PATH
+        & $script:WingetExe @argumentos
         $codigo = $LASTEXITCODE
 
         if ($codigo -in $codigosSucesso) {
@@ -233,7 +269,7 @@ function Instalar-Pacote {
         # ── Tentativa 2: sem locale (fallback quando pt-BR não existe para o pacote) ──
         if ($codigo -eq $codigoSemLocale -and $Locale -ne "") {
             Escrever-Aviso "Locale '$Locale' não disponível para '$NomeExibicao'. Repetindo sem localização..."
-            & winget @argumentosBase
+            & $script:WingetExe @argumentosBase
             $codigo = $LASTEXITCODE
 
             if ($codigo -in $codigosSucesso) {
@@ -477,7 +513,7 @@ Escrever-Secao "9/9 — Verificação de Disponibilidade: Google Antigravity"
 # Pesquisa o pacote no Winget para confirmar se existe
 try {
     Escrever-Info "Verificando disponibilidade do 'Google Antigravity' no repositório do Winget..."
-    $buscaAntigravity = winget search "Google Antigravity" --accept-source-agreements 2>&1
+    $buscaAntigravity = & $script:WingetExe search "Google Antigravity" --accept-source-agreements 2>&1
 
     # Verifica se algum resultado relevante foi retornado
     if ($buscaAntigravity -match "Nenhum pacote encontrado" -or
